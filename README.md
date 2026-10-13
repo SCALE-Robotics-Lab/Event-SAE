@@ -1,6 +1,8 @@
 # Event-SAE
 
-Event-grounded sparse autoencoder analysis of OpenVLA and OpenPI (pi0.5) on LIBERO.
+Code for [Event-Grounded Sparse Autoencoders for Vision-Language-Action Policies](https://arxiv.org/abs/2605.17204) (NeurIPS 2026).
+
+Supports OpenVLA and OpenPI (pi0.5) on LIBERO.
 
 [Paper](https://arxiv.org/abs/2605.17204) · [Installation](#installation) · [Pipeline](#pipeline)
 
