@@ -1,0 +1,4 @@
+suite: libero_spatial
+checkpoint: openvla/openvla-7b-finetuned-libero-spatial
+revision: 962318cec55ac10993ff0f5f43eda9a270b4c873
+code_revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f

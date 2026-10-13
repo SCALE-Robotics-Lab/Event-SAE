@@ -163,6 +163,8 @@ def annotate_clusters(
             )
             record = {
                 "cluster_id": cluster["cluster_id"],
+                "task_id": cluster["task_id"],
+                "task_suite_name": cluster["task_suite_name"],
                 "task_description": cluster["task_description"],
                 "model": model,
                 "prompt_version": PROMPT_VERSION,

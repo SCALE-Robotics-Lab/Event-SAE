@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "event-sae"
+version = "0.1.0"
+description = "Event-grounded sparse autoencoder analysis for vision-language-action policies."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+sae = ["torch>=2.2", "einops>=0.7", "tqdm", "pyyaml", "sentencepiece"]
+wandb = ["wandb==0.19.11"]
+vlm = ["google-genai"]
+analysis = ["torch==2.2.0", "transformers==4.48.1", "numpy==1.26.4", "scipy==1.15.3", "scikit-learn==1.7.2", "robosuite==1.4.0", "pillow", "imageio[ffmpeg]", "pyyaml"]
+
+[project.urls]
+Paper = "https://arxiv.org/abs/2605.17204"
+Repository = "https://github.com/xc-j/Event-SAE"
+
+[tool.setuptools.packages.find]
+where = [".", "third_party/dictionary_learning", "third_party/awe"]
+include = ["event_sae", "event_sae.*", "dictionary_learning", "dictionary_learning.*", "waypoint_extraction"]
+
+[tool.setuptools.package-dir]
+dictionary_learning = "third_party/dictionary_learning/dictionary_learning"
+waypoint_extraction = "third_party/awe/waypoint_extraction"
+
+[tool.setuptools.data-files]
+"share/licenses/event-sae/dictionary_learning" = ["third_party/dictionary_learning/LICENSE"]
+"share/licenses/event-sae/openvla" = ["third_party/openvla/LICENSE", "third_party/openvla/LICENSE.robosuite", "third_party/openvla/README.md"]

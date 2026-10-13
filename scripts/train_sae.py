@@ -1,18 +1,14 @@
 """CLI: offline SAE training on cached activation shards.
 
-Reads an `SAETrainConfig` from a YAML file and calls `event_sae.train_sae`.
+Reads an `SAETrainConfig` from a YAML file and calls `event_sae.train.train_sae`.
 """
 
 import argparse
-import sys
-from pathlib import Path
 from typing import Any
 
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from event_sae import SAETrainConfig, train_sae
+from event_sae.train import SAETrainConfig, train_sae
 
 
 def _coerce(raw: str) -> Any:
@@ -43,7 +39,7 @@ def main():
         data = yaml.safe_load(f) or {}
     for pair in args.override:
         if "=" not in pair:
-            continue
+            parser.error("--override requires field=value")
         key, raw = pair.split("=", 1)
         data[key] = _coerce(raw)
     cfg = SAETrainConfig(**data)

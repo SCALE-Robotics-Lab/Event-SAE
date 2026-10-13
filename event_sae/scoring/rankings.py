@@ -1,16 +1,8 @@
-"""Four feature-ranking strategies for SAE candidate selection.
+"""Rank SAE features by event alignment, window mean, task mean or random selection.
 
-Implements the rankings compared in paper Section 4.4:
-
-- ``event_aligned`` — top-N features per cluster row from an existing
-  event-feature score matrix (output of ``score_cluster_features.py``).
-- ``window_mean`` — for each cluster row, mean SAE activation over the
-  same event windows used by event-aligned, then top-N features.
-- ``task_mean`` — for each task, mean SAE activation over every rollout
-  timestep in the run, then top-N features.
-- ``random_alive`` — uniform random sample from features that fire at
-  least once in the run, excluding features already selected by any of
-  the three informed rankings.
+Score-based rankings read the scorer's matrices. Suite-level rankings filter
+cluster rows by episode coverage; each strategy defines its aggregation weights.
+Random controls sample positive-activation features excluding informed selections.
 """
 
 from __future__ import annotations
@@ -24,12 +16,6 @@ try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover
     tqdm = None
-
-
-
-# ---------------------------------------------------------------------------
-# Shared shard iteration
-# ---------------------------------------------------------------------------
 
 
 def _load_manifest(topk_run_dir: Path) -> dict:
@@ -60,26 +46,10 @@ def _top_pairs(vec: torch.Tensor, top_n: int) -> list[dict]:
     return [{"feature_id": int(i), "score": float(v)} for i, v in zip(indices.tolist(), values.tolist())]
 
 
-
-
-# ---------------------------------------------------------------------------
-# Ranking implementations
-# ---------------------------------------------------------------------------
-
-
 def _load_matrix(scores_pt_path: Path, key: str) -> tuple[torch.Tensor, list[dict]]:
-    """Load a named matrix + row_keys from a score artifact. Accepts both
-    the OpenPI-style payload with `matrix_raw / matrix_window_mean /
-    matrix_task_mean` and the legacy single-`matrix` payload."""
+    """Load a named matrix and row keys from the scorer output."""
     payload = torch.load(Path(scores_pt_path).resolve(), map_location="cpu")
-    if key in payload:
-        return payload[key].to(dtype=torch.float32), list(payload["row_keys"])
-    # Legacy: only `matrix` (= event_aligned matrix_raw). Used to be called
-    # `matrix` before the openpi-mech refactor; remap the three keys to the
-    # legacy single matrix so downstream still works on old artifacts.
-    if "matrix" in payload:
-        return payload["matrix"].to(dtype=torch.float32), list(payload["row_keys"])
-    raise KeyError(f"Score artifact missing '{key}' (and no legacy 'matrix'): {scores_pt_path}")
+    return payload[key].to(dtype=torch.float32), list(payload["row_keys"])
 
 
 def _load_event_aligned_matrix(scores_pt_path: Path) -> tuple[torch.Tensor, list[dict]]:
@@ -87,14 +57,15 @@ def _load_event_aligned_matrix(scores_pt_path: Path) -> tuple[torch.Tensor, list
 
 
 def event_aligned_top_features_per_row(scores_pt_path: Path, top_n: int) -> list[dict]:
-    """Read the score matrix produced by ``score_cluster_features.py`` and
-    return per-cluster-row top-N features."""
+    """Return the top-N event-aligned features for each cluster row."""
     matrix, row_keys = _load_event_aligned_matrix(scores_pt_path)
     out: list[dict] = []
     for row_idx, meta in enumerate(row_keys):
         out.append(
             {
                 "ranking": "event_aligned",
+                "task_id": meta["task_id"],
+                "task_suite_name": meta["task_suite_name"],
                 "task_description": str(meta["task_description"]),
                 "cluster_id": str(meta["cluster_id"]),
                 "phrase": str(meta.get("phrase", "")),
@@ -108,11 +79,7 @@ def event_aligned_top_features_per_row(scores_pt_path: Path, top_n: int) -> list
 def event_aligned_suite_top_k(
     scores_pt_path: Path, top_k: int, *, min_coverage: float = 0.5
 ) -> list[dict]:
-    """Suite-level top-K event-aligned features: mean of the score matrix
-    over **canonical** rows (``episode_coverage >= min_coverage``), then
-    top-K. Matches mechanistic-steering-vlas suite-config generator,
-    which averages over the canonical-filtered matrix (default
-    ``min_coverage=0.5``)."""
+    """Average rows with ``episode_coverage >= min_coverage`` equally, then take top-K."""
     matrix, row_keys = _load_event_aligned_matrix(scores_pt_path)
     keep_idx = [
         i
@@ -133,10 +100,7 @@ def window_mean_top_features_per_row(
     scores_pt_path: Path,
     top_n: int,
 ) -> list[dict]:
-    """Per cluster row, top-N features by mean SAE activation over the
-    cluster's event windows. Reads the pre-computed ``matrix_window_mean``
-    from the score artifact (built by
-    ``event_sae.scoring.score_matrix.score_cluster_features``)."""
+    """Return top-N window-mean features per cluster, omitting zero rows."""
     matrix, row_keys = _load_matrix(scores_pt_path, "matrix_window_mean")
     out: list[dict] = []
     for row_idx, meta in enumerate(row_keys):
@@ -145,6 +109,8 @@ def window_mean_top_features_per_row(
         out.append(
             {
                 "ranking": "window_mean",
+                "task_id": meta["task_id"],
+                "task_suite_name": meta["task_suite_name"],
                 "task_description": str(meta["task_description"]),
                 "cluster_id": str(meta["cluster_id"]),
                 "phrase": str(meta.get("phrase", "")),
@@ -161,10 +127,7 @@ def window_mean_suite_top_k(
     top_k: int,
     min_coverage: float = 0.5,
 ) -> list[dict]:
-    """Suite-level top-K window-mean features: ``num_events``-weighted
-    mean of per-row pre-computed ``matrix_window_mean`` vectors,
-    restricted to canonical rows (``episode_coverage >= min_coverage``),
-    then top-K."""
+    """Weight coverage-filtered cluster rows by ``num_events``, then take top-K."""
     matrix, row_keys = _load_matrix(scores_pt_path, "matrix_window_mean")
     keep_idx = [
         i
@@ -187,29 +150,27 @@ def window_mean_suite_top_k(
     return _top_pairs(suite_vec, top_k)
 
 
-
-
 def task_mean_top_features_per_task(
     *,
     scores_pt_path: Path,
     top_n: int,
 ) -> list[dict]:
-    """Per task, top-N features by mean SAE activation across every rollout
-    step. Reads pre-computed ``matrix_task_mean`` from the score artifact.
-    Note: rows here are per-cluster (each cluster broadcasts its task's
-    mean), so we dedupe by task_description for the per-task ranking."""
+    """Return top-N task-mean features, deduplicating cluster rows by suite and task ID."""
     matrix, row_keys = _load_matrix(scores_pt_path, "matrix_task_mean")
-    seen: dict[str, int] = {}
+    seen: dict[tuple, int] = {}
     for i, meta in enumerate(row_keys):
-        task = str(meta.get("task_description", ""))
-        if task and task not in seen:
+        task = (meta["task_suite_name"], meta["task_id"])
+        if task not in seen:
             seen[task] = i
     out: list[dict] = []
-    for task, idx in sorted(seen.items()):
+    for idx in sorted(seen.values(), key=lambda i: row_keys[i]["task_description"]):
+        meta = row_keys[idx]
         out.append(
             {
                 "ranking": "task_mean",
-                "task_description": task,
+                "task_description": str(meta["task_description"]),
+                "task_id": meta["task_id"],
+                "task_suite_name": meta["task_suite_name"],
                 "top_features": _top_pairs(matrix[idx], top_n),
             }
         )
@@ -222,15 +183,12 @@ def task_mean_suite_top_k(
     top_k: int,
     min_coverage: float = 0.5,
 ) -> list[dict]:
-    """Suite-level top-K task-mean features. Mirrors openpi-mech's
-    ``_task_mean_suite_vector``: dedupe canonical cluster rows by
-    ``task_description``, then take a per-task-timestep-count-weighted
-    mean across unique tasks."""
+    """Deduplicate coverage-filtered rows by suite and task ID, then rank task means.
+
+    Weight each task by its cached timestep count, using 1 for missing or zero counts.
+    """
     payload = torch.load(Path(scores_pt_path).resolve(), map_location="cpu")
-    matrix = payload.get("matrix_task_mean")
-    if matrix is None:
-        matrix = payload["matrix"]
-    matrix = matrix.to(dtype=torch.float32)
+    matrix = payload["matrix_task_mean"].to(dtype=torch.float32)
     row_keys = list(payload["row_keys"])
     keep_idx = [
         i
@@ -246,15 +204,15 @@ def task_mean_suite_top_k(
         payload.get("selection_counts", {}).get("task_timestep_counts", {}) or {}
     )
 
-    seen_tasks: set[str] = set()
+    seen_tasks: set[tuple] = set()
     vectors: list[torch.Tensor] = []
     weights: list[float] = []
     for i in keep_idx:
         meta = row_keys[i]
-        task_desc = str(meta.get("task_description", ""))
-        if task_desc in seen_tasks:
+        task = (meta["task_suite_name"], meta["task_id"])
+        if task in seen_tasks:
             continue
-        seen_tasks.add(task_desc)
+        seen_tasks.add(task)
         vectors.append(matrix[i])
         task_id = meta.get("task_id")
         weight = task_timestep_counts.get(task_id)
@@ -272,13 +230,14 @@ def task_mean_suite_top_k(
 
 
 def alive_feature_ids(topk_run_dir: Path) -> set[int]:
-    """Set of feature ids that fire at least once anywhere in the run."""
+    """Feature IDs with a positive activation anywhere in the cache."""
     topk_run_dir = Path(topk_run_dir).resolve()
     manifest = _load_manifest(topk_run_dir)
     alive: set[int] = set()
     for payload in _iter_shards(topk_run_dir, manifest, desc="alive scan"):
-        ids = payload["top_feature_ids"].to(dtype=torch.int64).reshape(-1).tolist()
-        alive.update(ids)
+        ids = payload["top_feature_ids"].to(dtype=torch.int64)
+        values = payload["top_feature_vals"]
+        alive.update(torch.unique(ids[values > 0]).tolist())
     return alive
 
 
@@ -289,9 +248,7 @@ def random_alive_features(
     exclude_feature_ids: set[int],
     seed: int = 0,
 ) -> list[int]:
-    """Uniform-random sample of ``num_features`` alive features, excluding
-    any feature already selected by the informed rankings. Paper Section
-    4.4 random-alive control."""
+    """Uniformly sample positive-activation features excluding informed selections."""
     alive = alive_feature_ids(topk_run_dir)
     candidates = sorted(alive - set(int(x) for x in exclude_feature_ids))
     if len(candidates) < num_features:

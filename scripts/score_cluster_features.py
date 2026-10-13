@@ -1,18 +1,13 @@
 """CLI: build event-feature score matrix.
 
-Joins per-event SAE top-k activations (either online sbatch output or the
-offline `scripts/extract_topk.py` output, both of which produce
-`token_topk_sparse_v1` shards) with VLM-annotated event clusters, and
+Joins `token_topk_sparse_v1` shards from `scripts/extract_topk.py` with event clusters, and
 writes a single `.pt` payload with the `(num_clusters, dict_size)` score
 matrix and per-row top-N feature summaries.
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from event_sae.scoring import score_cluster_features
 
@@ -27,15 +22,15 @@ def main() -> None:
     )
     parser.add_argument("--event-features-path", required=True, help="Path to event_features.jsonl")
     parser.add_argument("--cluster-assignments-path", required=True, help="Path to cluster_assignments.jsonl")
-    parser.add_argument("--cluster-annotations-path", required=True, help="Path to cluster_annotations.jsonl")
+    clusters = parser.add_mutually_exclusive_group(required=True)
+    clusters.add_argument("--clusters-path", help="Path to clusters.jsonl (no annotations needed)")
+    clusters.add_argument("--cluster-annotations-path", help="Path to legacy cluster_annotations.jsonl")
     parser.add_argument(
         "--prompt-records-path",
         default=None,
         help=(
-            "Path to prompt_records.jsonl from the dense collection run. Used to map every "
-            "episode to its task_id for matrix_task_mean (paper-faithful behavior: per-task "
-            "mean is over all rollout timesteps in the task, not only event-window timesteps). "
-            "If omitted, matrix_task_mean only averages over episodes that produced events."
+            "Episode/task mapping for all cached episodes, including those without events. "
+            "If omitted, task means include only episodes that produced events."
         ),
     )
     parser.add_argument("--output-path", required=True, help="Where to save the score matrix .pt payload")
@@ -58,7 +53,8 @@ def main() -> None:
         topk_run_dir=Path(args.topk_run_dir),
         event_features_path=Path(args.event_features_path),
         cluster_assignments_path=Path(args.cluster_assignments_path),
-        cluster_annotations_path=Path(args.cluster_annotations_path),
+        cluster_annotations_path=Path(args.cluster_annotations_path) if args.cluster_annotations_path else None,
+        clusters_path=Path(args.clusters_path) if args.clusters_path else None,
         output_path=Path(args.output_path),
         window_size=args.window_size,
         top_n=args.top_n,

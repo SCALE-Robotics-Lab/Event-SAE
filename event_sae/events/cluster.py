@@ -124,13 +124,27 @@ def cluster_events(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     records = load_jsonl(event_features_path)
-    by_task: dict[str, list[dict]] = defaultdict(list)
+    if len({record.get("task_suite_name") for record in records}) > 1:
+        raise ValueError("Cluster one task suite at a time.")
+    by_task: dict[int, list[dict]] = defaultdict(list)
     for record in records:
-        by_task[record["task_description"]].append(record)
+        by_task[int(record["task_id"])].append(record)
+
+    descriptions = {}
+    for task_id, task_records in by_task.items():
+        names = {record["task_description"] for record in task_records}
+        if len(names) != 1:
+            raise ValueError(f"Conflicting task descriptions for task ID {task_id}")
+        name = next(iter(names))
+        if name in descriptions:
+            raise ValueError(f"Task description maps to multiple IDs: {name}")
+        descriptions[name] = task_id
 
     assignments: list[dict] = []
     cluster_summaries: list[dict] = []
-    for task_description, task_records in sorted(by_task.items()):
+    for task_description, task_id in sorted(descriptions.items()):
+        task_records = by_task[task_id]
+        task_suite_name = task_records[0].get("task_suite_name")
         task_records = sorted(
             task_records,
             key=lambda item: (
@@ -175,6 +189,8 @@ def cluster_events(
             cluster_summaries.append(
                 {
                     "cluster_id": cluster_id,
+                    "task_id": task_id,
+                    "task_suite_name": task_suite_name,
                     "task_description": task_description,
                     "cluster_label": int(label),
                     "num_members": len(member_records),
@@ -200,6 +216,9 @@ def cluster_events(
             assignments.append(
                 {
                     "sample_id": record["sample_id"],
+                    "task_id": task_id,
+                    "task_suite_name": task_suite_name,
+                    "task_episode_idx": int(record["task_episode_idx"]),
                     "task_description": task_description,
                     "episode_num": int(record["episode_num"]),
                     "waypoint_step": int(record["waypoint_step"]),

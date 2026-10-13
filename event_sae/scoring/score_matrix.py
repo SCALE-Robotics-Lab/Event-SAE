@@ -1,47 +1,8 @@
-"""Event-feature score matrix.
+"""Score SAE features against clustered events using pulse and step templates.
 
-Joins per-event SAE top-k activations (from `event_sae.openvla.activations`
-or `event_sae.openpi.activations` either online or via
-`scripts/extract_topk.py`) with VLM-annotated event clusters, builds
-event-centered temporal windows around each event, and projects three
-time templates (pulse, step-up, step-down) onto the per-feature
-trajectory. The per-feature score is the maximum positive projection
-across templates; per-event scores are averaged within each
-`(cluster, episode)` group and then across episodes to give one row per
-cluster.
-
-Three matrices are produced per call, mirroring openpi-mech's
-`build_openpi_feature_score_matrix.py`:
-
-  - ``matrix_raw``         — `max(pulse, step_up, step_down)` over the
-                             3 templates (event_aligned score)
-  - ``matrix_window_mean`` — mean activation over each event's window
-                             (window_mean score)
-  - ``matrix_task_mean``   — per-task mean activation over every cached
-                             timestep (task_mean score)
-
-The ``step_mapping`` argument controls how shard rows map to env
-timesteps (mirrors openpi-mech):
-
-  - ``action_executed`` (OpenPI AE default): one env step per row at
-    ``chunk_start + token_idx`` when the token is executed.
-  - ``chunk_executed`` (OpenPI PG default): broadcast each row to every
-    executed env step of its chunk
-    (``chunk_start..chunk_start+executed_chunk_len-1``).
-  - ``inference_step`` (OpenVLA legacy / fallback): use ``step_in_episode``
-    directly (no chunk semantics).
-
-Output payload (single torch.save .pt):
-
-  - `matrix_raw` / `matrix_window_mean` / `matrix_task_mean`
-  - `matrix`               : alias of `matrix_raw` for backward compat
-  - `row_keys`             : per-row cluster metadata
-  - `row_results`          : per-row top-N feature summaries
-  - `templates`            : the three time templates used
-  - `selection_counts`     : join + filter accounting
-  - `selected_events`      : per-event provenance after scoring
-  - `step_mapping`         : the mapping used
-  - `source`               : input paths + manifest summary
+Consumes sparse activations from `scripts/extract_topk.py` and event clusters;
+semantic annotations are optional. Saves event-aligned, window-mean and task-mean
+matrices with cluster metadata and input provenance.
 """
 
 from __future__ import annotations
@@ -59,11 +20,6 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 from event_sae.events.io import load_jsonl
-
-
-# ---------------------------------------------------------------------------
-# Templates + projections
-# ---------------------------------------------------------------------------
 
 
 def _normalize_template(template: torch.Tensor) -> torch.Tensor:
@@ -108,11 +64,6 @@ def _row_top_summary(scores: torch.Tensor, top_n: int) -> dict[str, list]:
     return {"feature_ids": feature_ids, "scores": values}
 
 
-# ---------------------------------------------------------------------------
-# Window placement + per-step action-token aggregation
-# ---------------------------------------------------------------------------
-
-
 def _fit_step_window(
     *,
     center_step: int,
@@ -125,7 +76,9 @@ def _fit_step_window(
         return [], [], 0
     min_req, max_req = min(requested_steps), max(requested_steps)
     if (max_req - min_req) >= num_steps:
+        # Skip events in episodes shorter than the full window (11 steps by default).
         return None, requested_steps, None
+    # Shift the whole window to stay inside the episode, keeping its full length.
     shift = 0
     if max_req >= num_steps:
         shift -= max_req - (num_steps - 1)
@@ -135,11 +88,7 @@ def _fit_step_window(
 
 
 def build_templates_at_event_idx(window_size: int, event_idx: int) -> dict[str, torch.Tensor]:
-    """Boundary-aware templates: when the event window is shifted to stay
-    inside ``[0, num_steps)``, the event position inside the window may not
-    be the center any more. Templates are re-centered around
-    ``event_idx`` so pulse / step-up / step-down stay anchored on the
-    waypoint. Matches openpi-mech's ``_build_templates_at_event_idx``."""
+    """Anchor templates at the event's position within a boundary-shifted window."""
     if event_idx < 0 or event_idx > 2 * window_size:
         raise ValueError(f"event_idx={event_idx} outside window length {2 * window_size + 1}.")
     positions = torch.arange(2 * window_size + 1, dtype=torch.float32) - float(event_idx)
@@ -159,12 +108,12 @@ def _effective_steps_for_row(
     chunk_start_step: int,
     executed_chunk_len: int,
 ) -> list[int]:
-    """Translate a topk-shard row into the list of env steps it represents.
+    """Map a sparse row to environment steps.
 
-    Matches openpi-mech ``build_openpi_feature_score_matrix.py::_effective_steps``.
-    ``chunk_start_step`` and ``executed_chunk_len`` may be ``-1`` sentinels
-    on OpenVLA shards (no chunking); in that case only ``inference_step``
-    mode is valid.
+    Action-expert rows map to ``chunk_start_step + token_idx`` within the indexed
+    chunk; PaliGemma rows cover every step of that chunk. OpenVLA uses
+    ``step_in_episode`` and ignores the chunk fields, which may be -1.
+    OpenPI uses the index's planned ``executed_chunk_len``, not client actual counts.
     """
     if step_mapping == "inference_step":
         return [step_in_episode] if step_in_episode >= 0 else []
@@ -182,19 +131,12 @@ def _effective_steps_for_row(
 
 
 def _default_step_mapping(capture_target: str | None) -> str:
-    """Backend default: AE → action_executed (per-token executed env step);
-    PG → chunk_executed (prefix conditions whole executed chunk); anything
-    else → inference_step (OpenVLA legacy)."""
+    """Select action-token, chunk-wide or OpenVLA inference-step mapping."""
     if capture_target == "action_expert":
         return "action_executed"
     if capture_target == "paligemma":
         return "chunk_executed"
     return "inference_step"
-
-
-# ---------------------------------------------------------------------------
-# Cluster / event join
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -208,16 +150,33 @@ def join_cluster_events(
     *,
     event_features: list[dict],
     cluster_assignments: list[dict],
-    cluster_annotations: list[dict],
+    cluster_annotations: list[dict] | None = None,
+    clusters: list[dict] | None = None,
 ) -> _JoinResult:
-    """Join event_features + cluster_assignments + cluster_annotations, filter
-    out clusters with API/parse errors or empty phrase/phase."""
+    """Join events to clusters; retain legacy label filtering when annotations are supplied."""
+    metadata = cluster_annotations if cluster_annotations is not None else clusters
+    if metadata is None:
+        raise ValueError("Provide clusters or cluster annotations.")
+    suites = {r["task_suite_name"] for r in [*event_features, *cluster_assignments, *metadata]
+              if r.get("task_suite_name") is not None}
+    if len(suites) > 1:
+        raise ValueError("Score one task suite at a time.")
+    suite = next(iter(suites), None)
     event_by_sample_id = {}
+    episode_tasks = {}
+    task_names = {}
     for record in event_features:
         sample_id = str(record["sample_id"])
         if sample_id in event_by_sample_id:
             raise ValueError(f"Duplicate sample_id in event_features.jsonl: {sample_id}")
         event_by_sample_id[sample_id] = record
+        task_id = int(record["task_id"])
+        episode = int(record["episode_num"])
+        if episode_tasks.setdefault(episode, task_id) != task_id:
+            raise ValueError(f"Conflicting task IDs for episode {episode}")
+        name = str(record["task_description"])
+        if task_names.setdefault(task_id, name) != name:
+            raise ValueError(f"Conflicting descriptions for task ID {task_id}")
 
     counts = {
         "valid_clusters": 0,
@@ -231,26 +190,28 @@ def join_cluster_events(
     }
 
     cluster_metadata_by_id: dict[str, dict] = {}
-    for annotation in cluster_annotations:
-        if annotation.get("api_error") is not None:
+    for annotation in metadata:
+        if cluster_annotations is not None and annotation.get("api_error") is not None:
             counts["skipped_api_error"] += 1
             continue
-        if annotation.get("parse_error") is not None:
+        if cluster_annotations is not None and annotation.get("parse_error") is not None:
             counts["skipped_parse_error"] += 1
             continue
-        phrase = str(annotation.get("phrase", "")).strip()
-        if not phrase:
+        phrase = str(annotation.get("phrase", "")).strip() if cluster_annotations is not None else ""
+        if cluster_annotations is not None and not phrase:
             counts["skipped_empty_phrase"] += 1
             continue
-        phase = str(annotation.get("phase", "")).strip()
-        if not phase:
+        phase = str(annotation.get("phase", "")).strip() if cluster_annotations is not None else ""
+        if cluster_annotations is not None and not phase:
             counts["skipped_empty_phase"] += 1
             continue
         cluster_id = str(annotation["cluster_id"])
         if cluster_id in cluster_metadata_by_id:
-            raise ValueError(f"Duplicate cluster_id in cluster annotations: {cluster_id}")
+            raise ValueError(f"Duplicate cluster_id: {cluster_id}")
         cluster_metadata_by_id[cluster_id] = {
             "cluster_id": cluster_id,
+            "task_id": annotation.get("task_id"),
+            "task_suite_name": suite,
             "task_description": str(annotation["task_description"]),
             "phrase": phrase,
             "phase": phase,
@@ -276,13 +237,18 @@ def join_cluster_events(
         if event is None:
             counts["skipped_missing_event_features"] += 1
             continue
-        if str(event["task_description"]) != str(assignment["task_description"]):
-            raise ValueError(f"Task description mismatch for sample_id={sample_id}")
+        for record in (assignment, cluster_meta):
+            if str(event["task_description"]) != str(record["task_description"]):
+                raise ValueError(f"Task description mismatch for sample_id={sample_id}")
+            if record.get("task_id") is not None and int(record["task_id"]) != int(event["task_id"]):
+                raise ValueError(f"Task ID mismatch for sample_id={sample_id}")
+        cluster_meta["task_id"] = int(event["task_id"])
         joined_events.append(
             {
                 "sample_id": sample_id,
                 "task_description": str(event["task_description"]),
                 "task_id": int(event["task_id"]),
+                "task_suite_name": suite,
                 "task_episode_idx": int(event["task_episode_idx"]),
                 "episode_num": int(event["episode_num"]),
                 "waypoint_rank": int(event["waypoint_rank"]),
@@ -308,15 +274,8 @@ def join_cluster_events(
     return _JoinResult(joined_events, cluster_metadata_by_id, counts)
 
 
-# ---------------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------------
-
-
 def _load_manifest(topk_run_dir: Path) -> dict:
-    """Find a `token_topk_sparse_v1` manifest under ``topk_run_dir`` or any
-    immediate ``sae_activations/<submodule>/`` subdir (online OpenPI puts
-    shards in the subdir; offline extract_topk writes them flat)."""
+    """Load a sparse manifest from the run root or legacy ``sae_activations/<submodule>/``."""
     manifest_path = topk_run_dir / "manifest.json"
     if manifest_path.is_file():
         with manifest_path.open("r", encoding="utf-8") as f:
@@ -335,8 +294,7 @@ def _load_manifest(topk_run_dir: Path) -> dict:
 
 
 def _resolve_shard_path(topk_run_dir: Path, shard_relpath: str) -> Path:
-    """Shard paths in manifest may be relative to either the run root or
-    the legacy ``sae_activations/<submodule>`` subdir. Resolve to absolute."""
+    """Resolve a shard relative to the run root or a legacy activation subdirectory."""
     direct = topk_run_dir / shard_relpath
     if direct.is_file():
         return direct
@@ -345,6 +303,22 @@ def _resolve_shard_path(topk_run_dir: Path, shard_relpath: str) -> Path:
         if cand.is_file():
             return cand
     raise FileNotFoundError(f"Shard {shard_relpath} not under {topk_run_dir}")
+
+
+def _mean_action_token_rows(
+    forward_rows: dict[int, dict],
+    *,
+    dict_size: int,
+    action_dim: int,
+) -> torch.Tensor | None:
+    """Average the last-token sparse SAE rows across the first `action_dim` forwards."""
+    if len(forward_rows) < action_dim:
+        return None
+    step_vector = torch.zeros(dict_size, dtype=torch.float32)
+    for forward_idx in sorted(forward_rows)[:action_dim]:
+        row = forward_rows[forward_idx]
+        step_vector.index_add_(0, row["top_feature_ids"], row["top_feature_vals"])
+    return step_vector / float(action_dim)
 
 
 def _load_timestep_vectors(
@@ -361,18 +335,11 @@ def _load_timestep_vectors(
     dict,
     dict[str, int],
 ]:
-    """Walk topk shards and accumulate per-``(episode, env_step)`` dense
-    vectors under ``step_mapping``. Mirrors openpi-mech's
-    ``_load_timestep_vectors``:
+    """Build timestep vectors and task means from sparse shards.
 
-    * Filter by ``task_id`` (read EVERY episode in any selected task,
-      not just episodes that produced clustered events). This matters
-      because ``matrix_task_mean`` is the per-task mean over **all**
-      rollout timesteps the cache covers, not only event-window ones.
-    * Compute per-timestep means first, then aggregate task means as
-      the mean of per-timestep means weighted equally by timestep — not
-      by row count. Under ``chunk_executed`` a single row contributes to
-      multiple timesteps; row-count weighting overcounts wide chunks.
+    OpenVLA averages the last token from its first seven action forwards.
+    OpenPI averages rows mapped to each timestep. Task means weight timesteps
+    equally, not by token count, and include all mapped episodes of selected tasks.
     """
     manifest = _load_manifest(topk_run_dir)
     counters = {
@@ -386,6 +353,7 @@ def _load_timestep_vectors(
     timestep_sums: dict[tuple[int, int], torch.Tensor] = {}
     timestep_counts: dict[tuple[int, int], int] = defaultdict(int)
     timestep_task_ids: dict[tuple[int, int], int] = {}
+    last_token_rows: dict[tuple[int, int], dict[int, dict]] = defaultdict(dict)
 
     shard_iter = manifest["shards"]
     if tqdm is not None:
@@ -397,6 +365,7 @@ def _load_timestep_vectors(
         ep_arr = payload["episode_num"].to(dtype=torch.int64)
         step_arr = payload["step_in_episode"].to(dtype=torch.int64)
         tok_arr = payload["token_idx"].to(dtype=torch.int64)
+        forward_arr = payload["global_forward_idx"].to(dtype=torch.int64) if step_mapping == "inference_step" else None
         chunk_start_arr = payload.get("chunk_start_step")
         if chunk_start_arr is None:
             chunk_start_arr = torch.full_like(ep_arr, -1)
@@ -417,6 +386,22 @@ def _load_timestep_vectors(
             task_id = episode_to_task_id.get(ep)
             if task_id is None or task_id not in task_id_set:
                 counters["rows_skipped_unknown_task"] += 1
+                continue
+            if step_mapping == "inference_step":
+                step = int(step_arr[row_idx])
+                if step < 0:
+                    counters["rows_skipped_no_effective_step"] += 1
+                    continue
+                key = (ep, step)
+                fwd, tok = int(forward_arr[row_idx]), int(tok_arr[row_idx])
+                current = last_token_rows[key].get(fwd)
+                if current is None or tok > current["token_idx"]:
+                    last_token_rows[key][fwd] = {
+                        "token_idx": tok,
+                        "top_feature_ids": feat_ids[row_idx].clone(),
+                        "top_feature_vals": feat_vals[row_idx].clone(),
+                    }
+                timestep_task_ids[key] = task_id
                 continue
             steps = _effective_steps_for_row(
                 step_mapping=step_mapping,
@@ -447,14 +432,18 @@ def _load_timestep_vectors(
                 timestep_counts[key] += 1
                 counters["rows_used"] += 1
 
-    # Per-timestep mean.
     timestep_vectors: dict[tuple[int, int], torch.Tensor] = {}
     for key, vec_sum in timestep_sums.items():
         c = timestep_counts[key]
         if c > 0:
             timestep_vectors[key] = vec_sum / float(c)
+    if step_mapping == "inference_step":
+        for key, forward_rows in last_token_rows.items():
+            vec = _mean_action_token_rows(forward_rows, dict_size=dict_size, action_dim=7)
+            if vec is not None:
+                timestep_vectors[key] = vec
+                counters["rows_used"] += 7
 
-    # Per-task mean of per-timestep vectors. Mirrors openpi-mech.
     task_sums: dict[int, torch.Tensor] = {}
     task_counts: dict[int, int] = defaultdict(int)
     for key, vec in timestep_vectors.items():
@@ -477,36 +466,35 @@ def score_cluster_features(
     topk_run_dir: Path,
     event_features_path: Path,
     cluster_assignments_path: Path,
-    cluster_annotations_path: Path,
+    cluster_annotations_path: Path | None = None,
     output_path: Path,
     window_size: int = 5,
     top_n: int = 20,
     step_mapping: str = "auto",
     prompt_records_path: Path | None = None,
+    clusters_path: Path | None = None,
 ) -> dict:
-    """Build the event-feature score matrices and save a single `.pt`
-    payload. Mirrors openpi-mech ``build_openpi_feature_score_matrix.py``.
+    """Save three cluster-by-feature matrices and return their dimensions and counts.
 
-    Three matrices are produced (paper Table 4 / Fig 3):
+    ``matrix_raw`` averages each template's scores within (cluster, episode),
+    takes the maximum over templates, then averages across episodes.
+    ``matrix_window_mean`` averages event-window means within each episode group,
+    then across episodes. ``matrix_task_mean`` repeats each cluster's task mean.
+    ``matrix`` is a compatibility alias for ``matrix_raw``.
 
-      * ``matrix_raw``: max-over-templates projection (event_aligned)
-      * ``matrix_window_mean``: mean activation over the event window
-      * ``matrix_task_mean``: per-task mean activation across all
-        timesteps the cache covers
-
-    ``step_mapping`` defaults to ``"auto"``: pick per ``manifest.capture_target``
-    (``action_executed`` for ``action_expert``, ``chunk_executed`` for
-    ``paligemma``, otherwise ``inference_step``).
+    With ``step_mapping="auto"``, action expert uses ``action_executed``, PaliGemma
+    uses ``chunk_executed``, and OpenVLA uses ``inference_step``. OpenVLA templates
+    stay at the window center after boundary shifts; OpenPI templates follow the
+    event's position within the shifted window.
     """
     topk_run_dir = Path(topk_run_dir).resolve()
     event_features_path = Path(event_features_path).resolve()
     cluster_assignments_path = Path(cluster_assignments_path).resolve()
-    cluster_annotations_path = Path(cluster_annotations_path).resolve()
+    cluster_annotations_path = Path(cluster_annotations_path).resolve() if cluster_annotations_path is not None else None
+    clusters_path = Path(clusters_path).resolve() if clusters_path is not None else None
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Peek manifest for capture_target before joining, so step_mapping
-    # auto-detect runs before any aggregation.
     manifest = _load_manifest(topk_run_dir)
     dict_size = int(manifest["dict_size"])
     capture_target = manifest.get("capture_target")
@@ -516,7 +504,8 @@ def score_cluster_features(
     join = join_cluster_events(
         event_features=load_jsonl(event_features_path),
         cluster_assignments=load_jsonl(cluster_assignments_path),
-        cluster_annotations=load_jsonl(cluster_annotations_path),
+        cluster_annotations=load_jsonl(cluster_annotations_path) if cluster_annotations_path is not None else None,
+        clusters=load_jsonl(clusters_path) if clusters_path is not None else None,
     )
     if not join.selected_events:
         raise RuntimeError("No usable clustered events after the join.")
@@ -555,16 +544,18 @@ def score_cluster_features(
     if not usable_events:
         raise RuntimeError("No events remained after centered-window filtering.")
 
-    # Episode → task_id for the WHOLE run (not only event-window episodes).
-    # Paper's matrix_task_mean is the per-task mean over every cached
-    # timestep, so we need a full episode mapping. Prefer prompt_records;
-    # fall back to the event-only mapping if not provided (paper-style
-    # task_mean will be approximated).
+    # Prompt records include episodes without events; without them, task means
+    # are limited to episodes identified by usable events.
     episode_to_task_id: dict[int, int] = dict(event_episode_to_task_id)
     if prompt_records_path is not None:
         for record in load_jsonl(Path(prompt_records_path).resolve()):
             ep = int(record["episode_num"])
             tid = int(record["task_id"])
+            if ep in episode_to_task_id and episode_to_task_id[ep] != tid:
+                raise ValueError(f"Prompt/event task ID mismatch for episode {ep}")
+            suite = join.selected_events[0]["task_suite_name"]
+            if suite is not None and record.get("task_suite_name") not in (None, suite):
+                raise ValueError(f"Prompt/event suite mismatch for episode {ep}")
             episode_to_task_id[ep] = tid
     task_id_set: set[int] = set(event_episode_to_task_id.values())
 
@@ -576,7 +567,6 @@ def score_cluster_features(
         dict_size=dict_size,
     )
 
-    # ---- score per event ----
     episode_group_scores: dict[tuple[str, int], dict[str, list[torch.Tensor]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -599,7 +589,10 @@ def score_cluster_features(
         if not ok:
             skipped_missing_window_vectors += 1
             continue
-        templates_for_event = build_templates_at_event_idx(w, int(event["event_idx_in_window"]))
+        templates_for_event = (
+            build_templates(w) if step_mapping == "inference_step"
+            else build_templates_at_event_idx(w, int(event["event_idx_in_window"]))
+        )
         pattern_scores = _project_pattern_scores(centered, templates_for_event)
         group_key = (str(event["cluster_id"]), episode)
         for name, vec in pattern_scores.items():
@@ -611,6 +604,7 @@ def score_cluster_features(
                 "sample_id": event["sample_id"],
                 "task_description": event["task_description"],
                 "task_id": event["task_id"],
+                "task_suite_name": event["task_suite_name"],
                 "task_episode_idx": event["task_episode_idx"],
                 "episode_num": episode,
                 "waypoint_rank": event["waypoint_rank"],
@@ -629,7 +623,6 @@ def score_cluster_features(
     if not selected_event_payloads:
         raise RuntimeError("No events remained after activation-window filtering.")
 
-    # ---- aggregate per (cluster, episode) → per cluster ----
     row_scores: dict[str, list[torch.Tensor]] = defaultdict(list)
     row_window_means: dict[str, list[torch.Tensor]] = defaultdict(list)
     row_episode_counts: dict[str, int] = defaultdict(int)
@@ -677,6 +670,8 @@ def score_cluster_features(
         row_results.append(
             {
                 "task_description": meta["task_description"],
+                "task_id": meta["task_id"],
+                "task_suite_name": meta["task_suite_name"],
                 "cluster_id": cluster_id,
                 "phrase": meta["phrase"],
                 "phase": meta["phase"],
@@ -694,22 +689,27 @@ def score_cluster_features(
             "topk_run_dir": str(topk_run_dir),
             "event_features_path": str(event_features_path),
             "cluster_assignments_path": str(cluster_assignments_path),
-            "cluster_annotations_path": str(cluster_annotations_path),
+            "cluster_annotations_path": str(cluster_annotations_path) if cluster_annotations_path is not None else None,
+            "clusters_path": str(clusters_path) if clusters_path is not None else None,
+            "prompt_records_path": str(Path(prompt_records_path).resolve()) if prompt_records_path is not None else None,
             "dict_size": dict_size,
             "topk": int(manifest["topk"]),
             "layer": manifest.get("layer"),
             "sae_path": manifest.get("sae_path"),
             "capture_target": capture_target,
+            "pg_mode": manifest.get("pg_mode", "all") if capture_target == "paligemma" else None,
         },
         "window_size": window_size,
         "top_n": top_n,
         "step_mapping": step_mapping,
         "row_semantics": "(task_description, cluster_id, phrase, phase)",
         "score_definitions": {
-            "pulse": "positive projection onto a symmetric local-peak template (event-centered) after time-centering",
-            "step_up": "positive projection onto a low-to-high step template (event-centered) after time-centering",
-            "step_down": "positive projection onto a high-to-low step template (event-centered) after time-centering",
-            "combined_score": "max(pulse, step_up, step_down) per event, then averaged within (cluster, episode) and across episodes",
+            "pulse": "positive projection onto a symmetric local-peak template after time-centering",
+            "step_up": "positive projection onto a low-to-high step template after time-centering",
+            "step_down": "positive projection onto a high-to-low step template after time-centering",
+            "template_alignment": "window-centered" if step_mapping == "inference_step" else "event-centered",
+            "activation_row_semantics": "mean of last tokens from first seven forwards per step" if step_mapping == "inference_step" else "mean of rows mapped to each executed step",
+            "combined_score": "mean each template score within (cluster, episode), take max over templates, then mean across episodes",
             "matrix_raw": "per-cluster mean of combined_score (== event_aligned ranking)",
             "matrix_window_mean": "per-cluster mean of window-mean activation",
             "matrix_task_mean": "per-cluster, broadcast the per-task mean activation over all cached timesteps",
@@ -734,7 +734,6 @@ def score_cluster_features(
             }
             for cid in row_cluster_ids
         ],
-        # Three paper-faithful matrices + a `matrix` alias for backward compat.
         "matrix_raw": matrix_raw,
         "matrix_window_mean": matrix_window_mean,
         "matrix_task_mean": matrix_task_mean,

@@ -1,0 +1,2 @@
+config: pi05_libero
+checkpoint: gs://openpi-assets/checkpoints/pi05_libero

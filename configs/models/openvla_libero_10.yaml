@@ -1,0 +1,4 @@
+suite: libero_10
+checkpoint: openvla/openvla-7b-finetuned-libero-10
+revision: 80970322773f81baa2e22fe495d0487b93a05cfa
+code_revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f

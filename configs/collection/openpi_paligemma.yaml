@@ -1,0 +1,4 @@
+capture_target: paligemma
+layer_indices: "0"
+flush_every_rows: 50000
+replan_steps: 5

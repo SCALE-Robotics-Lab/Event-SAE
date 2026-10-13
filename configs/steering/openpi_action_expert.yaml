@@ -1,0 +1,6 @@
+mode: feature
+sae_checkpoint: outputs/sae/openpi-action-expert-layer5/trainer_0/ae.pt
+capture_target: action_expert
+layer_idx: 5
+feature_id: 0  # Replace with a selected feature, or use candidates/ranking/rank.
+feature_alpha: 0.0

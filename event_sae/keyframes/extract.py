@@ -4,7 +4,7 @@ Backbone-agnostic — operates on per-step `eef_pos` / `eef_quat` /
 `gripper_action` records produced by any rollout (openVLA, openpi, etc.).
 
 The dynamic-programming core call is `waypoint_extraction.dp_waypoint_selection`
-(see `external/awe/`).
+(see `third_party/awe/`).
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ class EpisodeTrajectory:
     quaternions: np.ndarray | None = None
     gripper_actions: np.ndarray | None = None
     gripper_qpos: np.ndarray | None = None
+    task_suite_name: str | None = None
 
 
 def _load_optional_vector_field(records: list[dict], key: str) -> np.ndarray | None:
@@ -81,6 +82,7 @@ def load_episode_trajectories(path: Path) -> list[EpisodeTrajectory]:
                 quaternions=quaternions,
                 gripper_actions=gripper_actions,
                 gripper_qpos=gripper_qpos,
+                task_suite_name=first.get("task_suite_name"),
             )
         )
     return episodes

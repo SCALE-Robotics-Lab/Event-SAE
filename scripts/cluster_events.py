@@ -1,16 +1,12 @@
 """CLI: task-local agglomerative clustering of event features.
 
 Reads `event_features.jsonl` produced by `scripts/build_event_features.py`,
-writes `cluster_assignments.jsonl` + `clusters.jsonl` + `summary.json`
-ready for `scripts/annotate_clusters.py`.
+writes `cluster_assignments.jsonl` + `clusters.jsonl` + `summary.json`.
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from event_sae.events.cluster import cluster_events
 
@@ -27,7 +23,10 @@ def main() -> None:
     parser.add_argument("--state-weight", type=float, default=0.5)
     parser.add_argument("--progress-weight", type=float, default=0.4)
     parser.add_argument("--distance-threshold", type=float, default=0.18)
-    parser.add_argument("--min-coverage", type=float, default=0.5)
+    parser.add_argument(
+        "--min-coverage", type=float, default=0.5,
+        help="Label canonical clusters only; retain all clusters. Ranking sets its own threshold. Default: 0.5.",
+    )
     parser.add_argument("--num-exemplars", type=int, default=5)
     args = parser.parse_args()
 

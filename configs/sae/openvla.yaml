@@ -1,0 +1,13 @@
+data_dir: outputs/openvla/sae_activations/resid_post
+layer_idx: 31
+activation_dim: 4096
+dict_size: 32768
+k: 64
+lr: 1.0e-4
+steps: 15000
+batch_size: 40000
+run_tag: openvla
+seed: 0
+warmup_steps: 1000
+threshold_start_step: 1000
+wandb_project: ""

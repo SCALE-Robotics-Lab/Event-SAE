@@ -1,0 +1,36 @@
+name: event-sae-openvla
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.2.0
+  - torchvision=0.17.0
+  - torchaudio=2.2.0
+  - pytorch-cuda=12.1
+  - numpy=1.26.4
+  - cmake<4
+  - pip:
+      - ninja==1.13.0
+      - transformers==4.48.1
+      - tokenizers==0.21.2
+      - timm==0.9.16
+      - accelerate==1.12.0
+      - tensorflow==2.16.1
+      - einops==0.8.1
+      - robosuite==1.4.0
+      - mujoco==3.5.0
+      - bddl==1.0.1
+      - gym==0.25.2
+      - robomimic==0.2.0
+      - numba==0.64.0
+      - easydict
+      - cloudpickle
+      - future
+      - matplotlib
+      - opencv-python==4.11.0.86
+      - imageio[ffmpeg]
+      - pyyaml
+      - setuptools<82

@@ -1,10 +1,10 @@
 """Render 5-frame bundle (PNGs + MP4 clip) around each AWE waypoint.
 
 Inputs:
-  - `waypoint_summary.json` from `event_sae.keyframes` (G1).
+  - `waypoint_summary.json` from `event_sae.keyframes`.
   - The corresponding `trajectory_records.jsonl` (path is stored inside the
     waypoint summary).
-  - The rollout MP4s under `<run_dir>/videos/`.
+  - `rollout.mp4`, or legacy episode videos under `<run_dir>/videos/`.
 
 Outputs (under `output_dir`):
   - `frames/<sample_id>/frame_NN_stepMMMM.png` (one image per frame)
@@ -76,13 +76,18 @@ def load_episode_records(path: Path) -> dict[int, EpisodeRecords]:
 
 
 def find_episode_video(run_dir: Path, episode_num: int) -> Path | None:
-    """Locate a per-episode MP4 in ``<run_dir>/videos/``. Supports two
-    naming conventions:
+    """Locate ``rollout.mp4`` written alongside trajectory records by
+    ``event_sae.rollout`` (the rollout entry point for both backends), or a legacy
+    per-episode MP4 under ``videos/``:
 
     * OpenVLA: ``...--episode=<N>--...mp4``
-    * OpenPI:  ``episode_<NNNNN>_task_...mp4`` (zero-padded, written by
-      ``event_sae.openpi.eval.runner``).
+    * OpenPI:  ``episode_<NNNNN>_task_...mp4`` (zero-padded).
     """
+    if (run_dir / "rollout.mp4").is_file():
+        result = json.loads((run_dir / "result.json").read_text())
+        if int(result["settings"].get("episode_num", 0)) == episode_num:
+            return run_dir / "rollout.mp4"
+        return None
     videos_dir = run_dir / "videos"
     if not videos_dir.is_dir():
         return None
@@ -301,6 +306,7 @@ def extract_keyframe_media(
                         "source_video_path": str(video_path),
                         "episode_num": episode_num,
                         "task_id": episode_meta.task_id,
+                        "task_suite_name": episode.get("task_suite_name"),
                         "task_episode_idx": episode_meta.task_episode_idx,
                         "task_description": episode_meta.task_description,
                         "prompt_task_description": episode_meta.prompt_task_description,

@@ -4,13 +4,11 @@ import math
 import os
 from typing import Tuple
 
-import imageio
 import numpy as np
 import tensorflow as tf
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
-from event_sae.openvla.eval.utils import DATE_TIME
 
 
 def get_libero_env(task, resolution: int = 256):
@@ -42,21 +40,8 @@ def get_libero_image(obs: dict, resize_size: int | Tuple[int, int]) -> np.ndarra
     return resize_image(img, resize_size)
 
 
-def save_rollout_video(rollout_images, idx: int, success: bool, task_description: str, out_dir: str, log_file=None):
-    os.makedirs(out_dir, exist_ok=True)
-    processed = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
-    mp4_path = f"{out_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed}.mp4"
-    writer = imageio.get_writer(mp4_path, fps=30)
-    for img in rollout_images:
-        writer.append_data(img)
-    writer.close()
-    print(f"Saved rollout MP4 at path {mp4_path}")
-    if log_file is not None:
-        log_file.write(f"Saved rollout MP4 at path {mp4_path}\n")
-    return mp4_path
-
-
 def quat2axisangle(quat: np.ndarray) -> np.ndarray:
+    # From robosuite via OpenVLA; see third_party/openvla/README.md and LICENSE.robosuite.
     if quat[3] > 1.0:
         quat[3] = 1.0
     elif quat[3] < -1.0:

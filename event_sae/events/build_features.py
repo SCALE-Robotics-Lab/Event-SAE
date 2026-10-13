@@ -38,9 +38,9 @@ def _l2_normalize(vec: np.ndarray) -> np.ndarray:
 
 
 class VisionEmbedder:
-    def __init__(self, model_name_or_path: str, device: str) -> None:
-        self.processor = AutoProcessor.from_pretrained(model_name_or_path)
-        self.model = AutoModel.from_pretrained(model_name_or_path).eval().to(device)
+    def __init__(self, model_name_or_path: str, device: str, revision: str | None = None) -> None:
+        self.processor = AutoProcessor.from_pretrained(model_name_or_path, revision=revision)
+        self.model = AutoModel.from_pretrained(model_name_or_path, revision=revision).eval().to(device)
         self.device = torch.device(device)
 
     @torch.no_grad()
@@ -145,6 +145,7 @@ def build_event_features(
     vision_model_name_or_path: str = "google/siglip-base-patch16-224",
     device: str | None = None,
     frame_positions: list[int] = (0, 1, 2, 3, 4),
+    vision_revision: str | None = None,
 ) -> None:
     """Compute vision embeddings + state vectors per sample and write event_features.jsonl."""
     samples_path = Path(samples_path).resolve()
@@ -156,7 +157,7 @@ def build_event_features(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     samples = load_jsonl(samples_path)
     state_index = build_episode_state_index(samples)
-    embedder = VisionEmbedder(vision_model_name_or_path, device)
+    embedder = VisionEmbedder(vision_model_name_or_path, device, revision=vision_revision)
 
     records: list[dict] = []
     for idx, sample in enumerate(samples, start=1):
@@ -177,6 +178,7 @@ def build_event_features(
             {
                 "sample_id": sample["sample_id"],
                 "task_id": int(sample["task_id"]),
+                "task_suite_name": sample.get("task_suite_name"),
                 "task_description": sample["task_description"],
                 "prompt_task_description": sample["prompt_task_description"],
                 "episode_num": episode_num,
@@ -188,6 +190,7 @@ def build_event_features(
                 "selected_frame_paths": selected_frame_paths,
                 "source_trajectory_records_path": trajectory_path,
                 "vision_model_name_or_path": vision_model_name_or_path,
+                "vision_revision": vision_revision,
                 "vision_frame_positions": list(frame_positions),
                 "vision_embedding": vision_embedding.astype(np.float32).tolist(),
                 "state_vector": state_vector.tolist(),

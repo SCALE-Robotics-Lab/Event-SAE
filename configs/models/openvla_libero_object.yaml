@@ -1,0 +1,4 @@
+suite: libero_object
+checkpoint: openvla/openvla-7b-finetuned-libero-object
+revision: 287d6cfdf12d07b1449505f66d9bf3550257e9b3
+code_revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f

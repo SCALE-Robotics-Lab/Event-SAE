@@ -1,41 +1,26 @@
-"""CLI: offline extract top-k SAE activations from dense shards.
-
-``--dense-dir`` is **the directory that contains ``activation_index.jsonl``**;
-each record's ``shard_path`` is resolved relative to that directory.
-
-Both layouts therefore work without code changes:
-
-* **OpenPI**: pass the eval run root, e.g.
-  ``logs/openpi/sae_collection/<run>/``. Index lives at the root and
-  ``shard_path`` is ``sae_activations/post_mlp_residual/layer_NN_shard_*.pt``.
-* **OpenVLA**: pass the per-target subdir, e.g.
-  ``logs/openvla/<run>/sae_activations/post_mlp_residual/``. Index and
-  shards are siblings inside it.
-
-Reads:
-  - Dense residual shards resolved from ``shard_path`` in the index.
-  - Trained ``BatchTopKSAE`` checkpoint (``ae.pt`` with sibling ``config.json``).
-
-Writes (under ``--output-dir``, default ``{dense_dir}/topk_activations``):
-  - ``shard_NNNNNN.pt`` with sparse top-k rows + metadata
-  - ``manifest.json`` in ``token_topk_sparse_v1`` format (same as online mode)
-
-The output is byte-format-compatible with
-``event_sae.openvla.activations.apply_sae_topk_collect_hooks``, so
-downstream scoring can consume either online or offline shards uniformly.
-"""
+"""Extract sparse top-k SAE features from indexed dense activation shards."""
 
 import argparse
 import json
-import sys
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from event_sae.sae import load_batch_topk_sae
 
-from event_sae.openvla.activations import load_batch_topk_sae
+
+def _valid_prefix(record: dict, tokenizer, token_idx: torch.Tensor) -> torch.Tensor:
+    # pi05_libero: two present 256-token images, one absent image, then 200 text slots.
+    if int(record.get("seq_len", 0)) != 968 or int(record.get("batch_size", 1)) != 1:
+        raise ValueError("attention-valid requires pi05_libero prefixes with shape [1, 968, width].")
+    prompt = record.get("task_description", record.get("prompt_task_description"))
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("Missing saved instruction for attention-valid extraction.")
+    prompt = prompt.strip().replace("_", " ").replace("\n", " ")
+    text_length = min(200, len(tokenizer.encode(prompt, add_bos=True) + tokenizer.encode("\n")))
+    return (token_idx < 512) | ((token_idx >= 768) & (token_idx < 768 + text_length))
 
 
 def _load_index(index_path: Path, layer_idx: int) -> dict[str, list[dict]]:
@@ -63,12 +48,14 @@ def main() -> None:
             "Directory that contains activation_index.jsonl; shard paths in the "
             "index are resolved relative to it. For OpenPI eval runs pass the run "
             "root (the index sits at the root). For OpenVLA collection runs pass "
-            "the per-target subdir (e.g. sae_activations/post_mlp_residual)."
+            "the per-target subdir (e.g. sae_activations/resid_post)."
         ),
     )
     parser.add_argument("--sae-checkpoint", required=True, help="Path to trained ae.pt")
     parser.add_argument("--layer-idx", type=int, required=True)
     parser.add_argument("--topk", type=int, default=64)
+    parser.add_argument("--pg-mode", choices=("all", "attention-valid"), default="all")
+    parser.add_argument("--tokenizer-model", type=Path, help="PaliGemma SentencePiece model for attention-valid mode.")
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -87,7 +74,6 @@ def main() -> None:
         if args.output_dir is not None
         else (dense_dir / "topk_activations").resolve()
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     sae, config = load_batch_topk_sae(Path(args.sae_checkpoint), device=device)
@@ -107,6 +93,21 @@ def main() -> None:
     # PG, inference_step for OpenVLA legacy).
     probe_record = next(iter(index.values()))[0]
     capture_target = probe_record.get("capture_target")
+    if any(r.get("capture_target") != capture_target for records in index.values() for r in records):
+        raise ValueError("Extract one capture target at a time.")
+    tokenizer = None
+    if args.pg_mode == "attention-valid":
+        if capture_target != "paligemma":
+            raise ValueError("attention-valid is only supported for PaliGemma.")
+        metadata = json.loads((dense_dir / "run_metadata.json").read_text())
+        if metadata.get("policy_config_name") != "pi05_libero":
+            raise ValueError("attention-valid recovery currently supports pi05_libero only.")
+        if args.tokenizer_model is None:
+            parser.error("--tokenizer-model is required for attention-valid mode")
+        import sentencepiece
+
+        tokenizer = sentencepiece.SentencePieceProcessor(model_file=str(args.tokenizer_model))
+    output_dir.mkdir(parents=True, exist_ok=False)
     executed_chunk_len_seen = sorted({
         int(r["executed_chunk_len"])
         for records in index.values()
@@ -122,11 +123,14 @@ def main() -> None:
         "activation_dim": activation_dim,
         "topk": args.topk,
         "capture_target": capture_target,
+        "pg_mode": args.pg_mode if capture_target == "paligemma" else None,
         "executed_chunk_lens_seen": executed_chunk_len_seen,
         "num_shards": 0,
         "total_rows": 0,
         "shards": [],
     }
+    if tokenizer is not None:
+        manifest["tokenizer_sha256"] = hashlib.sha256(args.tokenizer_model.read_bytes()).hexdigest()
 
     shard_names = sorted(index.keys())
     total_rows = 0
@@ -134,7 +138,7 @@ def main() -> None:
         src_shard_path = dense_dir / src_shard_name
         if not src_shard_path.is_file():
             raise FileNotFoundError(f"Missing dense shard: {src_shard_path}")
-        dense = torch.load(src_shard_path, map_location="cpu").to(torch.float32)
+        dense = torch.load(src_shard_path, map_location="cpu", weights_only=True).to(torch.float32)
         if dense.ndim != 2 or int(dense.shape[1]) != activation_dim:
             raise ValueError(
                 f"Unexpected dense shard shape {tuple(dense.shape)} in {src_shard_path}; "
@@ -148,23 +152,39 @@ def main() -> None:
         global_forward_idx = torch.zeros((n_rows,), dtype=torch.int64)
         token_idx = torch.zeros((n_rows,), dtype=torch.int64)
         batch_idx = torch.zeros((n_rows,), dtype=torch.int64)
+        task_id = torch.full((n_rows,), -1, dtype=torch.int64)
+        initial_state = torch.full((n_rows,), -1, dtype=torch.int64)
+        task_suite_name = [None] * n_rows
+        keep = torch.ones(n_rows, dtype=torch.bool)
         # OpenPI-only: per-row chunk_start_step + executed_chunk_len so
         # `score_cluster_features` can compute `_effective_steps` under the
         # chosen step_mapping. OpenVLA records leave these at -1 (sentinel).
         chunk_start_step = torch.full((n_rows,), -1, dtype=torch.int64)
         executed_chunk_len = torch.full((n_rows,), -1, dtype=torch.int64)
+        previous_end = 0
         for record in records:
             r0, r1 = int(record["row_start"]), int(record["row_end"])
+            if r0 != previous_end or not r0 < r1 <= n_rows:
+                raise ValueError(f"Noncontiguous or invalid row interval in {src_shard_name}: {r0}:{r1}")
+            previous_end = r1
+            if int(record.get("batch_size", 1)) != 1 or record.get("hidden_shape", [1])[0] != 1:
+                raise ValueError("Offline extraction expects single-observation rollout records.")
+            task_id[r0:r1] = int(record["task_id"])
+            initial_state[r0:r1] = int(record.get("initial_state", record.get("task_episode_idx", -1)))
+            task_suite_name[r0:r1] = [record.get("task_suite_name")] * (r1-r0)
             episode_num[r0:r1] = int(record.get("episode_num") or 0)
             global_forward_idx[r0:r1] = int(record.get("global_forward_idx") or 0)
             # Per-token env-step mapping. OpenPI records each forward as one
             # chunked inference covering `seq_len` future tokens; the env step
             # a token corresponds to is `chunk_start + token_idx`. OpenVLA
             # records each forward as one env-step (no chunking), and all
-            # rows of a record share the same `step_in_episode`. Matches
-            # openpi-mech's `step_mapping="action_executed"` semantics.
+            # rows of a record share the same `step_in_episode`.
             tokens_local = torch.arange(r1 - r0, dtype=torch.int64)
             token_idx[r0:r1] = tokens_local
+            if tokenizer is not None:
+                if r1 - r0 != int(record["seq_len"]):
+                    raise ValueError("Prefix row count does not match seq_len.")
+                keep[r0:r1] = _valid_prefix(record, tokenizer, tokens_local)
             chunk_start = record.get("chunk_start_step")
             if chunk_start is None:
                 chunk_start = record.get("action_chunk_start_step")
@@ -175,9 +195,13 @@ def main() -> None:
                 step_in_episode[r0:r1] = int(record.get("step_in_episode") or 0)
             if record.get("executed_chunk_len") is not None:
                 executed_chunk_len[r0:r1] = int(record["executed_chunk_len"])
+            elif capture_target in ("paligemma", "action_expert"):
+                raise ValueError("OpenPI index is missing executed_chunk_len; use a collection with planned chunk metadata.")
+        if previous_end != n_rows:
+            raise ValueError(f"Index does not cover every row in {src_shard_name}.")
 
         with torch.no_grad():
-            encoded = sae.encode(dense.to(device))
+            encoded = sae.encode(dense[keep].to(device))
             values, indices = torch.topk(encoded, k=args.topk, dim=-1)
             values = values.float().cpu()
             indices = indices.to(torch.int32).cpu()
@@ -185,18 +209,22 @@ def main() -> None:
         out_shard_name = f"shard_{manifest['num_shards']:06d}.pt"
         torch.save(
             {
-                "episode_num": episode_num,
-                "step_in_episode": step_in_episode,
-                "global_forward_idx": global_forward_idx,
-                "batch_idx": batch_idx,
-                "token_idx": token_idx,
-                "chunk_start_step": chunk_start_step,
-                "executed_chunk_len": executed_chunk_len,
+                "episode_num": episode_num[keep],
+                "step_in_episode": step_in_episode[keep],
+                "global_forward_idx": global_forward_idx[keep],
+                "batch_idx": batch_idx[keep],
+                "token_idx": token_idx[keep],
+                "task_id": task_id[keep],
+                "initial_state": initial_state[keep],
+                "task_suite_name": [name for name, selected in zip(task_suite_name, keep.tolist()) if selected],
+                "chunk_start_step": chunk_start_step[keep],
+                "executed_chunk_len": executed_chunk_len[keep],
                 "top_feature_ids": indices,
                 "top_feature_vals": values,
             },
             output_dir / out_shard_name,
         )
+        n_rows = int(keep.sum())
         manifest["shards"].append(
             {
                 "shard_idx": manifest["num_shards"],

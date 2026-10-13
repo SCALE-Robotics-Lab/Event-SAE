@@ -1,14 +1,7 @@
-"""SAE training entry point for offline activation shards.
-
-Migrated from `mechanistic-steering-vlas/src/sae_train/train.py`. Differences:
-- `device` is now a config field (auto-detected by default), instead of
-  hardcoded `"cuda:0"`.
-- Wandb logging is opt-in: set `wandb_project` to enable; empty string disables.
-"""
+"""Train a BatchTopK SAE on offline activation shards."""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,14 +28,21 @@ class SAETrainConfig:
     steps: int
     batch_size: int
     run_tag: str = "offline"
-    submodule_name: str = "post_mlp_residual"
+    submodule_name: str = "resid_post"
     device: str = ""           # Empty = auto (cuda if available else cpu).
     wandb_project: str = ""    # Empty = wandb disabled.
     wandb_group: str = ""
     num_workers: int = 4
     prefetch_factor: int = 2
     pin_memory: bool = True
-    # TODO: add optional trainer/runtime params (warmup/decay, auxk, seed, autocast).
+    seed: int = 0
+    warmup_steps: int = 1000
+    decay_start_fraction: float = 0.8
+    threshold_start_step: int = 1000
+    auxk_alpha: float = 1 / 32
+    save_interval: int = 1500
+    log_steps: int = 500
+    normalize_activations: bool = True
 
     def resolved_device(self) -> str:
         return self.device or _auto_device()
@@ -60,27 +60,24 @@ class _ActivationShardDataset(IterableDataset):
             local_shards = list(self.shard_paths)
         else:
             local_shards = list(self.shard_paths[worker.id :: worker.num_workers])
-        # Skip shards that cannot yield a full batch: they waste I/O and,
-        # if a worker is assigned ONLY such shards, would cause the
-        # DataLoader's round-robin to wait forever. File-size heuristic:
-        # rows ≈ shard_size / (activation_dim * 4 bytes-per-float32).
-        threshold_bytes = self.cfg.batch_size * self.cfg.activation_dim * 4
-        local_shards = [s for s in local_shards if s.stat().st_size >= threshold_bytes]
         if not local_shards:
-            return  # worker has nothing to yield; exit cleanly
+            return
+        generator = torch.Generator().manual_seed(
+            self.cfg.seed + (worker.id if worker is not None else 0)
+        )
         while True:
             if len(local_shards) > 1:
-                order = torch.randperm(len(local_shards)).tolist()
+                order = torch.randperm(len(local_shards), generator=generator).tolist()
                 shard_iter = [local_shards[i] for i in order]
             else:
                 shard_iter = local_shards
             for shard_path in shard_iter:
-                activations = torch.load(shard_path, map_location="cpu")
+                activations = torch.load(shard_path, map_location="cpu", weights_only=True)
                 if activations.ndim != 2:
                     raise ValueError(
                         f"Expected 2D activations in {shard_path}, got shape {tuple(activations.shape)}"
                     )
-                order = torch.randperm(activations.shape[0])
+                order = torch.randperm(activations.shape[0], generator=generator)
                 activations = activations[order].to(torch.float32)
                 for start in range(0, activations.shape[0], self.cfg.batch_size):
                     batch = activations[start : start + self.cfg.batch_size]
@@ -100,21 +97,18 @@ class ActivationShardDataLoader:
             raise FileNotFoundError(
                 f"No activation shards found in {cfg.data_dir} for layer {cfg.layer_idx}."
             )
-        self.shard_paths = shard_paths
-        self._dataset = _ActivationShardDataset(cfg, shard_paths)
-        # Clamp num_workers to the number of shards that can yield a full
-        # batch. A worker assigned only "too small" shards yields nothing
-        # and stalls the DataLoader's round-robin. File-size heuristic:
-        # rows ≈ shard_size / (activation_dim * 4 bytes-per-float32).
-        threshold_bytes = cfg.batch_size * cfg.activation_dim * 4
-        viable_count = sum(1 for p in shard_paths if p.stat().st_size >= threshold_bytes)
-        if viable_count == 0:
-            raise RuntimeError(
-                f"No shard in {cfg.data_dir} has >= {cfg.batch_size} rows "
-                f"(activation_dim={cfg.activation_dim}). Reduce batch_size, or "
-                f"recollect more activations."
-            )
-        num_workers = min(cfg.num_workers, viable_count)
+        viable_shards = []
+        for path in shard_paths:
+            tensor = torch.load(str(path), map_location="cpu", weights_only=True, mmap=True)
+            if tensor.ndim != 2 or tensor.shape[1] != cfg.activation_dim:
+                raise ValueError(f"Expected [rows, {cfg.activation_dim}] in {path}, got {tuple(tensor.shape)}")
+            if tensor.shape[0] >= cfg.batch_size:
+                viable_shards.append(path)
+        if not viable_shards:
+            raise ValueError(f"No shard has at least {cfg.batch_size} rows; reduce batch_size.")
+        self.shard_paths = viable_shards
+        self._dataset = _ActivationShardDataset(cfg, viable_shards)
+        num_workers = min(cfg.num_workers, len(viable_shards))
         dataloader_kwargs: dict[str, Any] = {
             "dataset": self._dataset,
             "batch_size": None,
@@ -126,19 +120,9 @@ class ActivationShardDataLoader:
             dataloader_kwargs["prefetch_factor"] = cfg.prefetch_factor
         self._dataloader = DataLoader(**dataloader_kwargs)
 
-        self.epoch = 0
-        self.global_step = 0
-        self.batches_in_epoch = 0
-        self.samples_seen = 0
-        self.current_shard = ""
-
     def __iter__(self):
-        self.batches_in_epoch = 0
         for batch in self._dataloader:
             batch = batch.to(self.device, non_blocking=True)
-            self.global_step += 1
-            self.batches_in_epoch += 1
-            self.samples_seen += int(batch.shape[0])
             yield batch
 
 
@@ -152,12 +136,14 @@ def build_batch_topk_trainer_config(cfg: SAETrainConfig) -> dict[str, Any]:
         "k": cfg.k,
         "lr": cfg.lr,
         "steps": cfg.steps,
-        "warmup_steps": 1000,
-        "decay_start": int(cfg.steps * 0.8),
-        "seed": 0,
+        "warmup_steps": cfg.warmup_steps,
+        "decay_start": int(cfg.steps * cfg.decay_start_fraction),
+        "seed": cfg.seed,
+        "threshold_start_step": cfg.threshold_start_step,
+        "auxk_alpha": cfg.auxk_alpha,
         "device": cfg.resolved_device(),
         "layer": cfg.layer_idx,
-        "lm_name": "openvla_offline",
+        "lm_name": cfg.run_tag,
         "submodule_name": cfg.submodule_name,
         "wandb_name": f"{cfg.run_tag}-l{cfg.layer_idx:02d}",
     }
@@ -167,23 +153,19 @@ def train_sae(cfg: SAETrainConfig, save_dir: str) -> None:
     """Train one BatchTopK SAE run on offline activation shards."""
     dataloader = ActivationShardDataLoader(cfg)
     trainer_cfg = build_batch_topk_trainer_config(cfg)
-    save_steps = list(range(1500, cfg.steps + 1, 1500))
-    wandb_project = cfg.wandb_project or os.environ.get("WANDB_PROJECT", "")
-    use_wandb = bool(wandb_project)
-    if use_wandb and cfg.wandb_group:
-        # Upstream `trainSAE` does not accept a `wandb_group` kwarg; wandb
-        # picks up grouping from the WANDB_RUN_GROUP env var instead.
-        os.environ["WANDB_RUN_GROUP"] = cfg.wandb_group
+    save_steps = list(range(cfg.save_interval, cfg.steps, cfg.save_interval))
     trainSAE(
         data=dataloader,
         trainer_configs=[trainer_cfg],
         steps=cfg.steps,
         save_dir=save_dir,
         save_steps=save_steps,
-        log_steps=500,
-        normalize_activations=True,
-        use_wandb=use_wandb,
-        wandb_project=wandb_project,
+        log_steps=cfg.log_steps,
+        normalize_activations=cfg.normalize_activations,
+        use_wandb=bool(cfg.wandb_project),
+        wandb_project=cfg.wandb_project,
+        wandb_group=cfg.wandb_group,
+        device=cfg.resolved_device(),
         verbose=True,
         autocast_dtype=torch.float32,
     )

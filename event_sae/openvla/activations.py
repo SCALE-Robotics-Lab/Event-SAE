@@ -1,26 +1,11 @@
-"""openVLA activation collection — register PyTorch forward hooks on decoder
-layers and cache layer-wise post-MLP residual activations to disk as shards.
+"""Dense OpenVLA decoder-layer activations and their rollout row indices."""
 
-Two modes (paper has data from both):
-
-- `apply_collect_hooks` (offline-friendly, default): dense residual shards
-  + `activation_index.jsonl` metadata. Top-k SAE encoding is a separate
-  offline pass via `scripts/extract_topk.py`.
-- `apply_sae_topk_collect_hooks` (online): load a trained `BatchTopKSAE`
-  and apply it inside the hook, writing sparse `token_topk_sparse_v1`
-  shards directly. Matches the older paper run.
-
-Per-step metadata is read from `model._sae_hook_context`, which
-`event_sae.openvla.eval.runner.eval_libero` sets before every `get_action`
-call.
-"""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 from typing import List
-
 import torch
 
 
@@ -37,36 +22,6 @@ class ActivationCollectHandle:
         self._flush_fn()
         for h in self._hooks:
             h.remove()
-
-
-def load_batch_topk_sae(checkpoint_path: Path, device: str):
-    """Load a `BatchTopKSAE` from a `trainSAE`-written checkpoint dir.
-
-    Shared by online hook + offline `scripts/extract_topk.py`.
-    """
-    from dictionary_learning.trainers.batch_top_k import BatchTopKSAE
-
-    checkpoint_path = Path(checkpoint_path)
-    trainer_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
-    config_path = trainer_dir / "config.json"
-    if not config_path.is_file():
-        config_path = trainer_dir.parent / "config.json"
-    with config_path.open("r", encoding="utf-8") as f:
-        config = json.load(f)
-    trainer_cfg = config["trainer"]
-    if trainer_cfg.get("dict_class") != "BatchTopKSAE":
-        raise ValueError(
-            f"Expected BatchTopKSAE checkpoint, got dict_class={trainer_cfg.get('dict_class')!r}"
-        )
-    ae_path = checkpoint_path if checkpoint_path.is_file() else (trainer_dir / "ae.pt")
-    sae = BatchTopKSAE.from_pretrained(str(ae_path), k=int(trainer_cfg["k"]), device=device)
-    sae.eval()
-    return sae, config
-
-
-# ---------------------------------------------------------------------------
-# Offline-friendly dense + metadata collection
-# ---------------------------------------------------------------------------
 
 
 def apply_collect_hooks(
@@ -131,6 +86,10 @@ def apply_collect_hooks(
                     "step_in_episode": ctx.get("step_in_episode"),
                     "task_id": ctx.get("task_id"),
                     "task_episode_idx": ctx.get("task_episode_idx"),
+                    "task_suite_name": ctx.get("task_suite_name"),
+                    "initial_state": ctx.get("initial_state"),
+                    "hidden_shape": list(hidden.shape),
+                    "token_selection": "all_forward_positions",
                     "global_forward_idx": int(global_forward_idx["value"]),
                 }
             )
@@ -143,137 +102,3 @@ def apply_collect_hooks(
 
     hooks = [decoder_layers[idx].register_forward_hook(make_hook(idx)) for idx in layer_idxs]
     return ActivationCollectHandle(hooks=hooks, flush_fn=flush_all)
-
-
-# ---------------------------------------------------------------------------
-# Online SAE-applied top-k collection
-# ---------------------------------------------------------------------------
-
-
-def apply_sae_topk_collect_hooks(
-    model,
-    layer_idx: int,
-    sae_checkpoint_path: str | Path,
-    output_dir: str | Path,
-    topk: int = 64,
-    rows_per_shard: int = 20_000,
-) -> ActivationCollectHandle:
-    """Online mode — apply a trained `BatchTopKSAE` inside the hook and write
-    sparse top-k shards (`token_topk_sparse_v1`) directly to `output_dir`.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    device = str(model.language_model.lm_head.weight.device)
-    sae, config = load_batch_topk_sae(Path(sae_checkpoint_path), device=device)
-    trainer_cfg = config["trainer"]
-    activation_dim = int(trainer_cfg["activation_dim"])
-    dict_size = int(trainer_cfg["dict_size"])
-    if not (1 <= topk <= dict_size):
-        raise ValueError(f"topk must be in [1, {dict_size}], got {topk}")
-
-    decoder_layers = model.language_model.model.layers
-    if not (0 <= layer_idx < len(decoder_layers)):
-        raise IndexError(f"Layer index out of range: {layer_idx}")
-
-    buffer: dict[str, list[torch.Tensor]] = {
-        "episode_num": [],
-        "step_in_episode": [],
-        "global_forward_idx": [],
-        "batch_idx": [],
-        "token_idx": [],
-        "top_feature_ids": [],
-        "top_feature_vals": [],
-    }
-    state = {"buffer_rows": 0, "shard_idx": 0, "total_rows": 0, "global_forward_idx": 0}
-    manifest = {
-        "format": "token_topk_sparse_v1",
-        "layer": layer_idx,
-        "sae_path": str(sae_checkpoint_path),
-        "dict_size": dict_size,
-        "activation_dim": activation_dim,
-        "topk": topk,
-        "rows_per_shard": rows_per_shard,
-        "num_shards": 0,
-        "total_rows": 0,
-        "shards": [],
-    }
-
-    def _take(key: str, n: int) -> torch.Tensor:
-        parts = []
-        remaining = n
-        while remaining > 0:
-            head = buffer[key][0]
-            take = min(remaining, int(head.shape[0]))
-            parts.append(head[:take])
-            if take == int(head.shape[0]):
-                buffer[key].pop(0)
-            else:
-                buffer[key][0] = head[take:]
-            remaining -= take
-        return torch.cat(parts, dim=0)
-
-    def _flush(n: int) -> None:
-        payload = {key: _take(key, n) for key in buffer}
-        shard_name = f"shard_{state['shard_idx']:06d}.pt"
-        torch.save(payload, output_dir / shard_name)
-        start = state["total_rows"]
-        end = start + n
-        manifest["shards"].append(
-            {
-                "shard_idx": state["shard_idx"],
-                "path": shard_name,
-                "num_rows": n,
-                "row_start": start,
-                "row_end": end,
-            }
-        )
-        state["shard_idx"] += 1
-        state["total_rows"] = end
-        state["buffer_rows"] -= n
-        manifest["num_shards"] = state["shard_idx"]
-        manifest["total_rows"] = state["total_rows"]
-
-    def hook_fn(module, inputs, output):
-        ctx = getattr(model, "_sae_hook_context", {}) or {}
-        episode_num = ctx.get("episode_num")
-        step_in_episode = ctx.get("step_in_episode")
-        if episode_num is None or step_in_episode is None:
-            return output
-        hidden = output[0]
-        if hidden.ndim != 3 or hidden.shape[-1] != activation_dim:
-            raise ValueError(
-                f"Unexpected hidden shape {tuple(hidden.shape)}; expected (batch, seq, {activation_dim})"
-            )
-        flat = hidden.reshape(-1, hidden.shape[-1]).to(device=hidden.device, dtype=torch.float32)
-        encoded = sae.encode(flat)
-        values, indices = torch.topk(encoded, k=topk, dim=-1)
-        state["global_forward_idx"] += 1
-        batch_size, seq_len = int(hidden.shape[0]), int(hidden.shape[1])
-        n_rows = batch_size * seq_len
-        buffer["episode_num"].append(torch.full((n_rows,), int(episode_num), dtype=torch.int64))
-        buffer["step_in_episode"].append(torch.full((n_rows,), int(step_in_episode), dtype=torch.int64))
-        buffer["global_forward_idx"].append(
-            torch.full((n_rows,), int(state["global_forward_idx"]), dtype=torch.int64)
-        )
-        buffer["batch_idx"].append(
-            torch.arange(batch_size, dtype=torch.int64).unsqueeze(1).expand(batch_size, seq_len).reshape(-1)
-        )
-        buffer["token_idx"].append(
-            torch.arange(seq_len, dtype=torch.int64).unsqueeze(0).expand(batch_size, seq_len).reshape(-1)
-        )
-        buffer["top_feature_ids"].append(indices.reshape(n_rows, topk).to(dtype=torch.int32).cpu())
-        buffer["top_feature_vals"].append(values.reshape(n_rows, topk).to(dtype=torch.float32).cpu())
-        state["buffer_rows"] += n_rows
-        while state["buffer_rows"] >= rows_per_shard:
-            _flush(rows_per_shard)
-        return output
-
-    hook = decoder_layers[layer_idx].register_forward_hook(hook_fn)
-
-    def flush_all() -> None:
-        if state["buffer_rows"] > 0:
-            _flush(state["buffer_rows"])
-        with (output_dir / "manifest.json").open("w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-
-    return ActivationCollectHandle(hooks=[hook], flush_fn=flush_all)

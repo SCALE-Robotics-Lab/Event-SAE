@@ -1,0 +1,6 @@
+mode: feature
+sae_checkpoint: outputs/sae/openpi-paligemma-layer0/trainer_0/ae.pt
+capture_target: paligemma
+layer_idx: 0
+feature_id: 0  # Replace with a selected feature, or use candidates/ranking/rank.
+feature_alpha: 0.0

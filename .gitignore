@@ -1,44 +1,30 @@
-# Private: not for public opensource release
-.claude/
-CLAUDE.md
-*_arxiv/
-*_arXiv/
-*_presentation/
-plan&todo.md
+# Python build and test artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
 
-# External libraries cloned by user (per README Step 2)
-external/LIBERO/
-external/dictionary_learning/
-external/awe/
+# Local environments and credentials
+.venv/
+.venv-*/
+venv/
+external/
+.env
+.env.*
 
-# Runtime outputs (eval rollouts, activation shards, SAE checkpoints, wandb, slurm logs)
+# Runtime outputs
+outputs/
 logs/
+checkpoints/
 wandb/
 
-# HPC submission scripts — cluster-specific, not part of the opensource surface
-sbatch_scripts/
-
-# Local-only dev tools (HTML viz, etc.)
-tools/
-
-# Staging dir for HF Hub upload of SAE checkpoints
-event-sae-openvla-libero/
-event-sae-openpi-libero/
-
-# Runtime-generated LIBERO config (written by event_sae.openpi.eval.libero_utils.prepare_libero_env)
-examples/libero/libero_config/config.yaml
-
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
-.ipynb_checkpoints/
-.venv/
-venv/
-
-# Editor / OS
+# Editor and operating-system files
 .vscode/
 .idea/
 .DS_Store
 *.swp
-external/openpi-event-sae/

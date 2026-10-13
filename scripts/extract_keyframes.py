@@ -6,16 +6,12 @@ listing per-episode waypoint indices.
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from event_sae.keyframes import (
-    EpisodeTrajectory,
     extract_waypoints_dp,
     filter_episodes,
     gripper_toggle_indices,
@@ -26,11 +22,7 @@ from event_sae.keyframes import (
 
 def _default_output_dir(records_path: Path, err_threshold: float, waypoint_mode: str) -> Path:
     threshold_tag = f"{err_threshold:.4f}".rstrip("0").rstrip(".").replace(".", "p")
-    # Pick the backend bucket from the source path so OpenPI runs do not
-    # land under logs/openvla/. Falls back to "openvla" for legacy layouts.
-    parts = records_path.resolve().parts
-    backend = next((p for p in parts if p in {"openvla", "openpi"}), "openvla")
-    return Path("logs") / backend / "keyframes" / records_path.parent.name / f"dp_{waypoint_mode}_err{threshold_tag}"
+    return records_path.parent / "keyframes" / f"dp_{waypoint_mode}_err{threshold_tag}"
 
 
 def main() -> None:
@@ -48,6 +40,7 @@ def main() -> None:
         "--success-filter", choices=("all", "success", "failure"), default="all"
     )
     parser.add_argument("--task-description", default=None, help="Exact task_description filter")
+    parser.add_argument("--suite", default=None, help="Suite for legacy trajectories that omit task_suite_name")
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--show-awe-logs", action="store_true", help="Don't suppress AWE internal prints")
     args = parser.parse_args()
@@ -57,6 +50,11 @@ def main() -> None:
         raise FileNotFoundError(f"trajectory_records.jsonl not found: {records_path}")
 
     episodes = load_episode_trajectories(records_path)
+    if args.suite is not None:
+        for episode in episodes:
+            if episode.task_suite_name not in (None, args.suite):
+                raise ValueError("--suite conflicts with the trajectory's task_suite_name")
+            episode.task_suite_name = args.suite
     selected = filter_episodes(
         episodes,
         success_filter=args.success_filter,
@@ -105,6 +103,7 @@ def main() -> None:
             {
                 "episode_num": episode.episode_num,
                 "task_id": episode.task_id,
+                "task_suite_name": episode.task_suite_name,
                 "task_episode_idx": episode.task_episode_idx,
                 "task_description": episode.task_description,
                 "prompt_task_description": episode.prompt_task_description,

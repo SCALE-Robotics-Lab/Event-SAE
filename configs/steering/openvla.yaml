@@ -1,0 +1,6 @@
+mode: feature
+sae_checkpoint: outputs/sae/openvla-layer31/trainer_0/ae.pt
+layer_idx: 31
+feature_id: 0  # Replace with a selected feature, or use candidates/ranking/rank.
+feature_alpha: 0.0
+hook_start_step: 0

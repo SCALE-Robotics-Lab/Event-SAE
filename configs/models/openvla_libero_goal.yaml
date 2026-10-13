@@ -1,0 +1,4 @@
+suite: libero_goal
+checkpoint: openvla/openvla-7b-finetuned-libero-goal
+revision: fa5ae1e7509348889295bba8e08621d8b55e9baf
+code_revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f
