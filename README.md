@@ -334,8 +334,10 @@ success rate and episode result paths to `summary.json` in the output directory.
 <details>
 <summary>Pretrained SAEs</summary>
 
-- [OpenVLA checkpoints](https://huggingface.co/mr-cabbage/event-sae-openvla-libero): layer 31 across all four LIBERO suites.
-- [OpenPI checkpoints](https://huggingface.co/mr-cabbage/event-sae-openpi-libero): action expert layers 0, 5, 17 and PaliGemma layers 0, 11, 16 on LIBERO-Spatial.
+[Download checkpoints on Hugging Face](https://huggingface.co/mr-cabbage/event-sae-libero).
+
+- OpenVLA: layer 31 across all four LIBERO suites.
+- OpenPI: action expert layers 0, 5, 17 and PaliGemma layers 0, 11, 16 on LIBERO-Spatial.
 
 </details>
 
